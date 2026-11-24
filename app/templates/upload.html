@@ -1,0 +1,40 @@
+{% extends "base.html" %}
+{% block content %}
+{% if mode == "baseline" %}
+  <h1>登记已验收的首版</h1>
+  <p class="hint">每个月份只登记一次首版。之后同月的新数据请作为候选批上传核对。</p>
+  <form method="post" enctype="multipart/form-data" class="card">
+    <label>月份
+      <input type="month" name="month" required>
+    </label>
+    <label>CSV 文件（渠道、日期、金额、转化数）
+      <input type="file" name="csv" accept=".csv,text/csv" required>
+    </label>
+    <button type="submit">登记首版</button>
+  </form>
+{% else %}
+  <h1>{{ month }} 上传候选批</h1>
+  {% if active %}
+    <p class="hint">现行基线批：V{{ active.version }}（{{ active.row_count }} 行 /
+      {{ active.channel_count }} 渠道）。候选只能与现行批比对。</p>
+  {% else %}
+    <p class="flash flash-error">该月份尚无已验收基线，请先登记首版。</p>
+  {% endif %}
+  <form method="post" enctype="multipart/form-data" class="card">
+    <label>CSV 文件（渠道、日期、金额、转化数）
+      <input type="file" name="csv" accept=".csv,text/csv" required>
+    </label>
+    <button type="submit">上传候选</button>
+  </form>
+{% endif %}
+
+<section class="card">
+  <h2>上传退回条件</h2>
+  <ul class="hint">
+    <li>渠道 + 日期组成唯一键，出现重复键即整批退回。</li>
+    <li>缺少基线中的渠道即退回。</li>
+    <li>任一渠道的金额或转化数整列为空即退回。</li>
+    <li>一个文件只能包含同一个月的数据。</li>
+  </ul>
+</section>
+{% endblock %}

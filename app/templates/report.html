@@ -1,0 +1,119 @@
+{% extends "base.html" %}
+{% block title %}报告 {{ report.report_no }}{% endblock %}
+{% block content %}
+<p><a href="{{ url_for('month_detail', month=report.month) }}">← {{ report.month }}</a></p>
+<h1>核对报告 {{ report.report_no }}</h1>
+<p>
+  月份 {{ report.month }} · 基线 V{{ report.baseline_version }} → 候选 V{{ report.candidate_version }}
+  · 生成于 {{ report.created_at }}
+</p>
+<p>
+  <span class="tag tag-{{ report.status }}">{{ {'passed': '待确认', 'rejected': '已退回', 'confirmed': '已生效', 'stale': '已失效'}[report.status] }}</span>
+  {% if report.verdict == 'passed' %}
+    <span class="tag tag-passed">核对通过</span>
+  {% else %}
+    <span class="tag tag-rejected">核对未通过</span>
+  {% endif %}
+</p>
+
+<section class="card">
+  <h3>偏差上限</h3>
+  <p>键缺失比例 ≤ {{ '%.2f%%'|format(report.thresholds.max_key_missing_ratio * 100) }}
+    · 空值率差 ≤ {{ '%.2f%%'|format(report.thresholds.max_null_rate_diff * 100) }}
+    · 分箱占比差 ≤ {{ '%.2f%%'|format(report.thresholds.max_bin_share_diff * 100) }}</p>
+</section>
+
+{% if report.reasons %}
+<section class="card">
+  <h3>退回 / 失效原因</h3>
+  <ul class="reasons">
+    {% for reason in report.reasons %}<li>{{ reason }}</li>{% endfor %}
+  </ul>
+</section>
+{% endif %}
+
+{% if report.details.missing_channels %}
+<section class="card">
+  <h3>缺少基线渠道（整批退回）</h3>
+  <p class="reasons">{{ report.details.missing_channels|join('、') }}</p>
+</section>
+{% endif %}
+
+{% if report.details.extra_channels %}
+<p class="hint">候选额外渠道（不参与比对）：{{ report.details.extra_channels|join('、') }}</p>
+{% endif %}
+
+{% for channel in report.details.channels %}
+<section class="card channel-card">
+  <h3>{{ channel.channel }}</h3>
+  <table class="metrics">
+    <thead>
+      <tr>
+        <th>指标</th><th>基线键数</th><th>候选键数</th><th>缺失键</th><th>键缺失比例</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>键</td>
+        <td>{{ channel.baseline_key_count }}</td>
+        <td>{{ channel.candidate_key_count }}</td>
+        <td>{{ channel.missing_key_count }}</td>
+        <td class="{{ 'over' if channel.missing_ratio > report.thresholds.max_key_missing_ratio else '' }}">{{ fmt_pct(channel.missing_ratio) }}</td>
+      </tr>
+    </tbody>
+  </table>
+
+  {% for metric_key, metric_label in [('amount', '金额'), ('conversions', '转化数')] %}
+    {% set metric = channel[metric_key] %}
+    <h4>{{ metric_label }}</h4>
+    <p>
+      空值率：基线 {{ fmt_pct(metric.baseline_null_rate) }} ·
+      候选 {{ fmt_pct(metric.candidate_null_rate) }} ·
+      差
+      <span class="{{ 'over' if metric.null_rate_diff is not none and (metric.null_rate_diff|abs) > report.thresholds.max_null_rate_diff else '' }}">{{ fmt_diff(metric.null_rate_diff) }}</span>
+      <span class="muted">（上限 {{ fmt_pct(report.thresholds.max_null_rate_diff) }}；非空 {{ metric.baseline_nonempty }} → {{ metric.candidate_nonempty }}）</span>
+    </p>
+    <table class="bins">
+      <thead>
+        <tr><th>箱（基线四分位切点）</th><th>基线数</th><th>候选数</th>
+          <th>基线占比</th><th>候选占比</th><th>占比差</th></tr>
+      </thead>
+      <tbody>
+      {% for label in metric.labels %}
+        {% set index = loop.index0 %}
+        {% set diff = metric.share_diffs[index] if metric.share_diffs else none %}
+        <tr>
+          <td>{{ label }}</td>
+          <td>{{ metric.baseline_counts[index] }}</td>
+          <td>{{ metric.candidate_counts[index] }}</td>
+          <td>{{ fmt_pct(metric.baseline_shares[index]) }}</td>
+          <td>{{ fmt_pct(metric.candidate_shares[index]) }}</td>
+          <td class="{{ 'over' if diff is not none and (diff|abs) > report.thresholds.max_bin_share_diff else '' }}">{{ fmt_diff(diff) }}</td>
+        </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+  {% endfor %}
+
+  {% if channel.violations %}
+    <ul class="reasons">
+      {% for reason in channel.violations %}<li>{{ reason }}</li>{% endfor %}
+    </ul>
+  {% endif %}
+</section>
+{% endfor %}
+
+{% if report.status == 'passed' %}
+<section class="card">
+  <h2>确认生效</h2>
+  <p class="hint">确认后候选批 V{{ report.candidate_version }} 成为 {{ report.month }} 的现行批，供下游取数；候选与报告一同生效，任一步失败则保留原批。</p>
+  <form method="post" action="{{ url_for('confirm', report_no=report.report_no) }}">
+    <button type="submit">确认生效</button>
+  </form>
+</section>
+{% elif report.status == 'stale' %}
+<p class="flash flash-error">该报告已失效{% if report.details.baseline %}（基线 V{{ report.baseline_version }} 已不是现行批）{% endif %}，请对候选重新核对。</p>
+{% elif report.status == 'confirmed' %}
+<p class="flash flash-success">已确认生效于 {{ report.confirmed_at }}。</p>
+{% endif %}
+{% endblock %}

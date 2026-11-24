@@ -1,0 +1,7 @@
+.git
+.gitignore
+instance
+tests
+__pycache__
+*.pyc
+*.sqlite3

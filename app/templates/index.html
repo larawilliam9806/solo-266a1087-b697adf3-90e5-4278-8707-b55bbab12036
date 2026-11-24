@@ -1,0 +1,33 @@
+{% extends "base.html" %}
+{% block content %}
+<h1>月份</h1>
+<p class="hint">下游按月取现行批；核对只读候选明细与基线预存统计。</p>
+{% if months %}
+<table class="grid">
+  <thead>
+    <tr><th>月份</th><th>现行批</th><th>待核对候选</th><th>批次数</th><th></th></tr>
+  </thead>
+  <tbody>
+  {% for item in months %}
+    <tr>
+      <td><a href="{{ url_for('month_detail', month=item.month) }}">{{ item.month }}</a></td>
+      <td>
+        {% if item.active %}
+          V{{ item.active.version }}
+          <span class="muted">（{{ item.active.row_count }} 行 /
+            {{ item.active.channel_count }} 渠道）</span>
+        {% else %}
+          <span class="muted">—</span>
+        {% endif %}
+      </td>
+      <td>{{ item.pending_count }}</td>
+      <td>{{ item.batch_count }}</td>
+      <td><a href="{{ url_for('month_detail', month=item.month) }}">进入</a></td>
+    </tr>
+  {% endfor %}
+  </tbody>
+</table>
+{% else %}
+<p class="empty">还没有任何批次。先<a href="{{ url_for('register_baseline') }}">登记已验收的首版</a>。</p>
+{% endif %}
+{% endblock %}

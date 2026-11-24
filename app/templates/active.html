@@ -1,0 +1,29 @@
+{% extends "base.html" %}
+{% block content %}
+<p><a href="{{ url_for('month_detail', month=month) }}">← {{ month }}</a></p>
+<h1>{{ month }} 现行批 V{{ page.batch.version }}</h1>
+<p class="hint">下游按现行批取数；共 {{ page.total }} 行。</p>
+<p><a class="button secondary" href="{{ url_for('active_csv', month=month) }}">下载 CSV</a></p>
+<table class="grid">
+  <thead><tr><th>渠道</th><th>日期</th><th>金额</th><th>转化数</th></tr></thead>
+  <tbody>
+  {% for row in page.rows %}
+    <tr>
+      <td>{{ row.channel }}</td>
+      <td>{{ row.day }}</td>
+      <td>{{ '—' if row.amount is none else row.amount }}</td>
+      <td>{{ '—' if row.conversions is none else row.conversions }}</td>
+    </tr>
+  {% endfor %}
+  </tbody>
+</table>
+<div class="pager">
+  {% if page.offset > 0 %}
+    <a href="?offset={{ [page.offset - page.limit, 0]|max }}&limit={{ page.limit }}">上一页</a>
+  {% endif %}
+  <span class="muted">第 {{ page.offset + 1 }}–{{ [page.offset + page.limit, page.total]|min }} 行</span>
+  {% if page.offset + page.limit < page.total %}
+    <a href="?offset={{ page.offset + page.limit }}&limit={{ page.limit }}">下一页</a>
+  {% endif %}
+</div>
+{% endblock %}

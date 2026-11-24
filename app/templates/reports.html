@@ -1,0 +1,19 @@
+{% extends "base.html" %}
+{% block content %}
+<h1>按报告号查询</h1>
+<form method="get" class="card inline">
+  <label>报告号
+    <input type="text" name="report_no" value="{{ report_no }}" placeholder="R20261124-0001" required>
+  </label>
+  <button type="submit">查询</button>
+</form>
+{% if report_no and not report %}
+  <p class="flash flash-error">未找到报告 {{ report_no }}。</p>
+{% elif report %}
+  <p>报告 <a href="{{ url_for('report_detail', report_no=report.report_no) }}">{{ report.report_no }}</a>
+    · {{ report.month }} · 基线 V{{ report.baseline_version }} → 候选 V{{ report.candidate_version }}
+    · {{ {'passed': '通过', 'rejected': '退回'}[report.verdict] }}
+    · <span class="tag tag-{{ report.status }}">{{ {'passed': '待确认', 'rejected': '已退回', 'confirmed': '已生效', 'stale': '已失效'}[report.status] }}</span>
+  </p>
+{% endif %}
+{% endblock %}

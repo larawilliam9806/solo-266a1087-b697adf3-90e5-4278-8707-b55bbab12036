@@ -1,0 +1,68 @@
+{% extends "base.html" %}
+{% block title %}{{ month }} · 渠道日报换交核对{% endblock %}
+{% block content %}
+<h1>{{ month }}</h1>
+<div class="toolbar">
+  <a class="button" href="{{ url_for('upload_candidate', month=month) }}">上传候选批</a>
+  <a class="button secondary" href="{{ url_for('active_view', month=month) }}">查看现行批数据</a>
+  <a class="button secondary" href="{{ url_for('active_csv', month=month) }}">下载现行批 CSV</a>
+</div>
+
+<section class="card">
+  <h2>现行批</h2>
+  {% if active %}
+    <p><strong>V{{ active.version }}</strong> · {{ active.row_count }} 行 ·
+      {{ active.channel_count }} 渠道
+      {% if active.activated_report_no %}
+        · 生效报告 <a href="{{ url_for('report_detail', report_no=active.activated_report_no) }}">{{ active.activated_report_no }}</a>
+      {% endif %}
+      <span class="muted">（{{ active.activated_at }}）</span>
+    </p>
+  {% else %}
+    <p class="empty">尚无现行批。</p>
+  {% endif %}
+</section>
+
+<section class="card">
+  <h2>批次</h2>
+  <table class="grid">
+    <thead><tr><th>版本</th><th>状态</th><th>来源文件</th><th>行数</th><th>渠道</th><th>报告</th><th></th></tr></thead>
+    <tbody>
+    {% for batch in batches %}
+      <tr>
+        <td>V{{ batch.version }}</td>
+        <td><span class="tag tag-{{ batch.status }}">{{ {'active': '现行', 'pending': '待核对', 'superseded': '已换版'}[batch.status] }}</span></td>
+        <td>{{ batch.source_filename or '—' }}</td>
+        <td>{{ batch.row_count }}</td>
+        <td>{{ batch.channel_count }}</td>
+        <td>{{ batch.report_count }}</td>
+        <td><a href="{{ url_for('batch_detail', month=month, batch_id=batch.id) }}">明细</a></td>
+      </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+</section>
+
+<section class="card">
+  <h2>核对报告</h2>
+  {% if reports %}
+  <table class="grid">
+    <thead><tr><th>报告号</th><th>基线</th><th>候选</th><th>结论</th><th>状态</th><th>时间</th></tr></thead>
+    <tbody>
+    {% for report in reports %}
+      <tr>
+        <td><a href="{{ url_for('report_detail', report_no=report.report_no) }}">{{ report.report_no }}</a></td>
+        <td>V{{ report.baseline_version }}</td>
+        <td>V{{ report.candidate_version }}</td>
+        <td>{{ {'passed': '通过', 'rejected': '退回'}[report.verdict] }}</td>
+        <td><span class="tag tag-{{ report.status }}">{{ {'passed': '待确认', 'rejected': '已退回', 'confirmed': '已生效', 'stale': '已失效'}[report.status] }}</span></td>
+        <td>{{ report.created_at }}</td>
+      </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+  {% else %}
+    <p class="empty">还没有核对报告。</p>
+  {% endif %}
+</section>
+{% endblock %}

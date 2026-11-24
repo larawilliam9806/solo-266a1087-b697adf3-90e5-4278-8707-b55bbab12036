@@ -1,0 +1,74 @@
+{% extends "base.html" %}
+{% block title %}V{{ batch.version }} · {{ month }}{% endblock %}
+{% block content %}
+<p><a href="{{ url_for('month_detail', month=month) }}">← {{ month }}</a></p>
+<h1>批次 V{{ batch.version }}（{{ month }}）</h1>
+<p>
+  <span class="tag tag-{{ batch.status }}">{{ {'active': '现行', 'pending': '待核对', 'superseded': '已换版'}[batch.status] }}</span>
+  来源文件 {{ batch.source_filename or '—' }} · {{ batch.row_count }} 行 · {{ batch.channel_count }} 渠道
+  · 登记于 {{ batch.created_at }}
+</p>
+
+{% if batch.status == 'pending' %}
+<section class="card">
+  <h2>与现行基线核对</h2>
+  {% if active %}
+  <p class="hint">以现行基线 V{{ active.version }} 为基准。两版均使用基线四分位切点分箱；核对只读候选明细与基线预存的键和统计。</p>
+  <form method="post" action="{{ url_for('run_reconcile', month=month, batch_id=batch.id) }}" class="card inline">
+    <label>键缺失比例上限
+      <input type="number" name="max_key_missing_ratio" min="0" max="1" step="0.0001" value="0.01" required>
+    </label>
+    <label>空值率差上限
+      <input type="number" name="max_null_rate_diff" min="0" max="1" step="0.0001" value="0.02" required>
+    </label>
+    <label>分箱占比差上限
+      <input type="number" name="max_bin_share_diff" min="0" max="1" step="0.0001" value="0.05" required>
+    </label>
+    <button type="submit">开始核对</button>
+  </form>
+  {% else %}
+  <p class="flash flash-error">该月份尚无现行基线批，无法核对。</p>
+  {% endif %}
+</section>
+{% endif %}
+
+{% if reports %}
+<section class="card">
+  <h2>该候选的报告</h2>
+  <ul>
+  {% for report in reports %}
+    <li><a href="{{ url_for('report_detail', report_no=report.report_no) }}">{{ report.report_no }}</a>
+      — {{ {'passed': '通过', 'rejected': '退回'}[report.verdict] }}，
+      <span class="tag tag-{{ report.status }}">{{ {'passed': '待确认', 'rejected': '已退回', 'confirmed': '已生效', 'stale': '已失效'}[report.status] }}</span>
+    </li>
+  {% endfor %}
+  </ul>
+</section>
+{% endif %}
+
+<section class="card">
+  <h2>明细（共 {{ page.total }} 行）</h2>
+  <table class="grid">
+    <thead><tr><th>渠道</th><th>日期</th><th>金额</th><th>转化数</th></tr></thead>
+    <tbody>
+    {% for row in page.rows %}
+      <tr>
+        <td>{{ row.channel }}</td>
+        <td>{{ row.day }}</td>
+        <td>{{ '—' if row.amount is none else row.amount }}</td>
+        <td>{{ '—' if row.conversions is none else row.conversions }}</td>
+      </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+  <div class="pager">
+    {% if page.offset > 0 %}
+      <a href="?offset={{ [page.offset - page.limit, 0]|max }}&limit={{ page.limit }}">上一页</a>
+    {% endif %}
+    <span class="muted">第 {{ page.offset + 1 }}–{{ [page.offset + page.limit, page.total]|min }} 行</span>
+    {% if page.offset + page.limit < page.total %}
+      <a href="?offset={{ page.offset + page.limit }}&limit={{ page.limit }}">下一页</a>
+    {% endif %}
+  </div>
+</section>
+{% endblock %}

@@ -1,0 +1,16 @@
+services:
+  reconcile:
+    build: .
+    image: channel-daily-reconcile:latest
+    container_name: channel-daily-reconcile
+    ports:
+      - "8000:8000"
+    environment:
+      SECRET_KEY: ${SECRET_KEY:-change-me-before-production}
+      DATABASE_PATH: /data/reconcile.sqlite3
+    volumes:
+      - reconcile-data:/data
+    restart: unless-stopped
+
+volumes:
+  reconcile-data:
