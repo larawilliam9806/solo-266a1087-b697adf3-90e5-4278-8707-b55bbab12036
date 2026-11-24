@@ -16,16 +16,17 @@
   <p class="hint">以现行基线 V{{ active.version }} 为基准。两版均使用基线四分位切点分箱；核对只读候选明细与基线预存的键和统计。</p>
   <form method="post" action="{{ url_for('run_reconcile', month=month, batch_id=batch.id) }}" class="card inline">
     <label>键缺失比例上限
-      <input type="number" name="max_key_missing_ratio" min="0" max="1" step="0.0001" value="0.01" required>
+      <input type="number" name="max_key_missing_ratio" min="0" max="1" step="any" value="0.01" required>
     </label>
     <label>空值率差上限
-      <input type="number" name="max_null_rate_diff" min="0" max="1" step="0.0001" value="0.02" required>
+      <input type="number" name="max_null_rate_diff" min="0" max="1" step="any" value="0.02" required>
     </label>
     <label>分箱占比差上限
-      <input type="number" name="max_bin_share_diff" min="0" max="1" step="0.0001" value="0.05" required>
+      <input type="number" name="max_bin_share_diff" min="0" max="1" step="any" value="0.05" required>
     </label>
     <button type="submit">开始核对</button>
   </form>
+  <p class="hint">上限可填 0 到 1 之间的任意有限十进制数（如 0.3333333333333333）；偏差按绝对值与上限精确比较，等于上限也算达标。</p>
   {% else %}
   <p class="flash flash-error">该月份尚无现行基线批，无法核对。</p>
   {% endif %}

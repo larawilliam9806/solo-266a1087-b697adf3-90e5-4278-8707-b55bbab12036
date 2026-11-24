@@ -1,6 +1,7 @@
 {% extends "base.html" %}
 {% block title %}报告 {{ report.report_no }}{% endblock %}
 {% block content %}
+{% set v2 = report.details.get('format') == 2 %}
 <p><a href="{{ url_for('month_detail', month=report.month) }}">← {{ report.month }}</a></p>
 <h1>核对报告 {{ report.report_no }}</h1>
 <p>
@@ -14,13 +15,14 @@
   {% else %}
     <span class="tag tag-rejected">核对未通过</span>
   {% endif %}
+  {% if not v2 %}<span class="tag">旧口径报告</span>{% endif %}
 </p>
 
 <section class="card">
   <h3>偏差上限</h3>
-  <p>键缺失比例 ≤ {{ '%.2f%%'|format(report.thresholds.max_key_missing_ratio * 100) }}
-    · 空值率差 ≤ {{ '%.2f%%'|format(report.thresholds.max_null_rate_diff * 100) }}
-    · 分箱占比差 ≤ {{ '%.2f%%'|format(report.thresholds.max_bin_share_diff * 100) }}</p>
+  <p>键缺失比例 ≤ {{ fmt_threshold(report.thresholds.max_key_missing_ratio) }}{% if v2 %} <span class="muted">（{{ '%.2f%%'|format(report.thresholds.max_key_missing_ratio|float * 100) }}）</span>{% endif %}
+    · 空值率差 ≤ {{ fmt_threshold(report.thresholds.max_null_rate_diff) }}{% if v2 %} <span class="muted">（{{ '%.2f%%'|format(report.thresholds.max_null_rate_diff|float * 100) }}）</span>{% endif %}
+    · 分箱占比差 ≤ {{ fmt_threshold(report.thresholds.max_bin_share_diff) }}{% if v2 %} <span class="muted">（{{ '%.2f%%'|format(report.thresholds.max_bin_share_diff|float * 100) }}）</span>{% endif %}</p>
 </section>
 
 {% if report.reasons %}
@@ -58,7 +60,7 @@
         <td>{{ channel.baseline_key_count }}</td>
         <td>{{ channel.candidate_key_count }}</td>
         <td>{{ channel.missing_key_count }}</td>
-        <td class="{{ 'over' if channel.missing_ratio > report.thresholds.max_key_missing_ratio else '' }}">{{ fmt_pct(channel.missing_ratio) }}</td>
+        <td class="{{ 'over' if channel.missing_over else '' }}">{{ fmt_pct(channel.missing_ratio) }}{% if v2 %} <span class="exact" title="由缺失键数 / 基线键数精确计算">{{ channel.missing_ratio_text }}</span>{% endif %}</td>
       </tr>
     </tbody>
   </table>
@@ -70,8 +72,15 @@
       空值率：基线 {{ fmt_pct(metric.baseline_null_rate) }} ·
       候选 {{ fmt_pct(metric.candidate_null_rate) }} ·
       差
-      <span class="{{ 'over' if metric.null_rate_diff is not none and (metric.null_rate_diff|abs) > report.thresholds.max_null_rate_diff else '' }}">{{ fmt_diff(metric.null_rate_diff) }}</span>
-      <span class="muted">（上限 {{ fmt_pct(report.thresholds.max_null_rate_diff) }}；非空 {{ metric.baseline_nonempty }} → {{ metric.candidate_nonempty }}）</span>
+      <span class="{{ 'over' if metric.null_rate_over else '' }}"{% if v2 and metric.null_rate_diff_text %} title="精确差值 {{ metric.null_rate_diff_text }}"{% endif %}>{{ fmt_diff(metric.null_rate_diff) }}</span>{% if v2 and metric.null_rate_diff_text %} <span class="exact">{{ metric.null_rate_diff_text }}</span>{% endif %}
+      {% if v2 %}
+      <span class="muted">（上限 {{ report.thresholds.max_null_rate_diff }}；空值计数 基线
+        {{ metric.baseline_null_count }}/{{ channel.baseline_key_count }} · 候选
+        {% if metric.present %}{{ metric.candidate_null_count }}/{{ channel.candidate_key_count }}{% else %}—{% endif %}；
+        非空 {{ metric.baseline_nonempty }} → {{ metric.candidate_nonempty }}）</span>
+      {% else %}
+      <span class="muted">（上限 {{ fmt_threshold(report.thresholds.max_null_rate_diff) }}；非空 {{ metric.baseline_nonempty }} → {{ metric.candidate_nonempty }}）</span>
+      {% endif %}
     </p>
     <table class="bins">
       <thead>
@@ -82,13 +91,15 @@
       {% for label in metric.labels %}
         {% set index = loop.index0 %}
         {% set diff = metric.share_diffs[index] if metric.share_diffs else none %}
+        {% set over = metric.share_overs[index] if metric.share_overs else false %}
+        {% set diff_text = metric.share_diff_texts[index] if (v2 and metric.share_diff_texts) else none %}
         <tr>
           <td>{{ label }}</td>
           <td>{{ metric.baseline_counts[index] }}</td>
           <td>{{ metric.candidate_counts[index] }}</td>
           <td>{{ fmt_pct(metric.baseline_shares[index]) }}</td>
           <td>{{ fmt_pct(metric.candidate_shares[index]) }}</td>
-          <td class="{{ 'over' if diff is not none and (diff|abs) > report.thresholds.max_bin_share_diff else '' }}">{{ fmt_diff(diff) }}</td>
+          <td class="{{ 'over' if over else '' }}"{% if diff_text %} title="精确差值 {{ diff_text }}"{% endif %}>{{ fmt_diff(diff) }}{% if diff_text %} <span class="exact">{{ diff_text }}</span>{% endif %}</td>
         </tr>
       {% endfor %}
       </tbody>
@@ -106,10 +117,15 @@
 {% if report.status == 'passed' %}
 <section class="card">
   <h2>确认生效</h2>
+  {% if v2 %}
   <p class="hint">确认后候选批 V{{ report.candidate_version }} 成为 {{ report.month }} 的现行批，供下游取数；候选与报告一同生效，任一步失败则保留原批。</p>
   <form method="post" action="{{ url_for('confirm', report_no=report.report_no) }}">
     <button type="submit">确认生效</button>
   </form>
+  {% else %}
+  <p class="flash flash-info">该报告是升级前的旧口径结论，不能确认。请用已上传的候选批重新核对，取得新通过报告后再确认。</p>
+  <p><a class="button secondary" href="{{ url_for('batch_detail', month=report.month, batch_id=report.candidate_batch_id) }}">前往候选批 V{{ report.candidate_version }} 重新核对</a></p>
+  {% endif %}
 </section>
 {% elif report.status == 'stale' %}
 <p class="flash flash-error">该报告已失效{% if report.details.baseline %}（基线 V{{ report.baseline_version }} 已不是现行批）{% endif %}，请对候选重新核对。</p>

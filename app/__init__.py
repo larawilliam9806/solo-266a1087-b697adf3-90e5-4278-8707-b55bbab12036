@@ -43,7 +43,11 @@ def create_app(test_config: dict | None = None) -> Flask:
 
     @app.context_processor
     def inject_helpers():
-        return {"fmt_pct": _fmt_pct, "fmt_diff": _fmt_diff}
+        return {
+            "fmt_pct": _fmt_pct,
+            "fmt_diff": _fmt_diff,
+            "fmt_threshold": _fmt_threshold,
+        }
 
     @app.get("/")
     def index():
@@ -319,6 +323,15 @@ def _fmt_diff(value):
     if value is None:
         return "—"
     return f"{value * 100:+.2f}%"
+
+
+def _fmt_threshold(value):
+    """上限展示：新报告存精确十进制文本，原样显示；旧报告为浮点，按百分比显示。"""
+    if value is None:
+        return "—"
+    if isinstance(value, str):
+        return value
+    return f"{value * 100:.2f}%"
 
 
 def _csv_num(value: float) -> str:

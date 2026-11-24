@@ -498,3 +498,294 @@ def test_each_candidate_gets_independent_report_and_stale_on_other_confirm(app):
         assert get_db().execute(
             "SELECT status FROM batches WHERE id = ?", (first["id"],)
         ).fetchone()["status"] == "pending"
+
+
+# ---------------------------------------------------------------------------
+# 精确比较：上限为有限十进制，偏差从计数算出，等于上限也达标
+# ---------------------------------------------------------------------------
+
+
+def test_ratio_text_exact_rendering():
+    from fractions import Fraction
+
+    assert service._ratio_text(Fraction(0)) == "0"
+    assert service._ratio_text(Fraction(1, 2)) == "0.5"
+    assert service._ratio_text(Fraction(1, 4)) == "0.25"
+    assert service._ratio_text(Fraction(1, 8)) == "0.125"
+    assert service._ratio_text(Fraction(1, 10)) == "0.1"
+    assert service._ratio_text(Fraction(3, 40)) == "0.075"
+    assert service._ratio_text(Fraction(7, 2)) == "3.5"
+    assert service._ratio_text(Fraction(1, 3)) == "1/3≈0.333333"
+    assert service._ratio_text(Fraction(2, 7)) == "2/7≈0.285714"
+    assert service._diff_text(Fraction(1, 10)) == "+0.1"
+    assert service._diff_text(Fraction(-1, 8)) == "-0.125"
+    assert service._diff_text(Fraction(0)) == "0"
+    assert service._diff_text(Fraction(-1, 3)) == "-1/3≈0.333333"
+
+
+def _seed_rows(app, rows, month="2026-11"):
+    client = app.test_client()
+    response = upload(client, "/baseline", make_csv(rows), month=month)
+    assert "已验收登记" in response.get_data(as_text=True)
+    return client
+
+
+def _downgrade_report_to_legacy(app, report_no):
+    """把报告改写成升级前的旧格式（无 format 标记、上限为浮点数）。"""
+    with app.app_context():
+        db = get_db()
+        row = db.execute(
+            "SELECT thresholds, details FROM reports WHERE report_no = ?",
+            (report_no,),
+        ).fetchone()
+        thresholds = {
+            key: float(value)
+            for key, value in json.loads(row["thresholds"]).items()
+        }
+        details = json.loads(row["details"])
+        details.pop("format", None)
+        details["thresholds"] = thresholds
+        for channel in details["channels"]:
+            channel.pop("missing_ratio_text", None)
+            channel.pop("missing_over", None)
+            for metric_key in ("amount", "conversions"):
+                metric = channel[metric_key]
+                for key in (
+                    "null_rate_diff_text",
+                    "null_rate_over",
+                    "share_diff_texts",
+                    "share_overs",
+                    "baseline_null_count",
+                    "candidate_null_count",
+                ):
+                    metric.pop(key, None)
+        db.execute(
+            "UPDATE reports SET thresholds = ?, details = ? WHERE report_no = ?",
+            (json.dumps(thresholds), json.dumps(details), report_no),
+        )
+
+
+def test_key_missing_ratio_exact_boundary(app):
+    """基线 3 天、候选缺 1 天：1/3 精确大于 0.3333333333333333，应退回。"""
+    _seed_rows(app, [("A", f"2026-11-0{d}", d * 10, d) for d in (1, 2, 3)])
+    rows = [("A", "2026-11-01", 10, 1), ("A", "2026-11-02", 20, 2)]
+    candidate = _candidate(app, rows)
+    report = _reconcile(
+        app, candidate["id"], key="0.3333333333333333", null=1, share=1
+    )
+    assert report["verdict"] == "rejected"
+    with app.app_context():
+        stored = service.get_report(report["report_no"])
+    assert any("键缺失比例" in reason for reason in stored["reasons"])
+    # 退回的报告没有确认入口
+    page = app.test_client().get(f"/reports/{report['report_no']}")
+    assert "确认生效</button>" not in page.get_data(as_text=True)
+
+    # 上限略大于 1/3 即可通过
+    candidate2 = _candidate(app, rows, filename="cand2.csv")
+    report2 = _reconcile(
+        app, candidate2["id"], key="0.3333333333333334", null=1, share=1
+    )
+    assert report2["verdict"] == "passed"
+
+
+def test_key_missing_ratio_equal_to_limit_passes(app):
+    """缺失比例恰为有限小数上限（1/4 = 0.25）时达标。"""
+    _seed_rows(app, [("A", f"2026-11-0{d}", d * 10, d) for d in (1, 2, 3, 4)])
+    rows = [("A", f"2026-11-0{d}", d * 10, d) for d in (1, 2, 3)]
+    candidate = _candidate(app, rows)
+    report = _reconcile(app, candidate["id"], key="0.25", null=1, share=1)
+    assert report["verdict"] == "passed"
+
+
+def test_null_rate_diff_equal_limit_passes_and_page_consistent(app):
+    """空值率 3/10 → 4/10，差恰为 0.1，上限 0.1：通过且页面不标红。"""
+    base = [
+        ("A", f"2026-11-{d:02d}", (None if d <= 3 else d * 10), d)
+        for d in range(1, 11)
+    ]
+    _seed_rows(app, base)
+    rows = [
+        ("A", f"2026-11-{d:02d}", (None if d <= 4 else d * 10), d)
+        for d in range(1, 11)
+    ]
+    candidate = _candidate(app, rows)
+    report = _reconcile(app, candidate["id"], key=1, null="0.1", share=1)
+    assert report["verdict"] == "passed"
+    with app.app_context():
+        stored = service.get_report(report["report_no"])
+    assert stored["details"]["format"] == 2
+    channel = stored["details"]["channels"][0]
+    assert channel["amount"]["null_rate_diff_text"] == "+0.1"
+    assert channel["amount"]["null_rate_over"] is False
+    page = app.test_client().get(f"/reports/{report['report_no']}")
+    assert 'class="over"' not in page.get_data(as_text=True)
+
+
+def test_bin_share_diff_exact_boundary(app):
+    """占比差恰为 0.25 时达标；上限小任意一点即退回。"""
+    _seed_rows(app, [("A", f"2026-11-0{d}", d, d) for d in (1, 2, 3, 4)])
+    rows = [
+        ("A", "2026-11-01", 1, 1),
+        ("A", "2026-11-02", 1, 2),
+        ("A", "2026-11-03", 2, 3),
+        ("A", "2026-11-04", 3, 4),
+    ]
+    candidate = _candidate(app, rows)
+    report = _reconcile(app, candidate["id"], key=1, null=1, share="0.25")
+    assert report["verdict"] == "passed"
+
+    candidate2 = _candidate(app, rows, filename="cand2.csv")
+    report2 = _reconcile(
+        app, candidate2["id"], key=1, null=1, share="0.24999999999999999"
+    )
+    assert report2["verdict"] == "rejected"
+    with app.app_context():
+        stored = service.get_report(report2["report_no"])
+    assert any("非空占比差" in reason for reason in stored["reasons"])
+
+
+def test_threshold_validation_finite_decimal(app):
+    _seed(app)
+    for accepted in ("0.3333333333333333", "1e-1", "0", "1", "0.0000000000000001"):
+        thresholds = service.validate_thresholds(
+            {
+                "max_key_missing_ratio": accepted,
+                "max_null_rate_diff": accepted,
+                "max_bin_share_diff": accepted,
+            }
+        )
+        assert all(0 <= value <= 1 for value in thresholds.values())
+    for rejected, message in (
+        ("abc", "有限十进制"),
+        ("nan", "有限十进制"),
+        ("inf", "有限十进制"),
+        ("-0.1", "0 到 1"),
+        ("1.5", "0 到 1"),
+        ("", "请填写"),
+    ):
+        with pytest.raises(service.ServiceError) as excinfo:
+            service.validate_thresholds(
+                {
+                    "max_key_missing_ratio": rejected,
+                    "max_null_rate_diff": "0.1",
+                    "max_bin_share_diff": "0.1",
+                }
+            )
+        assert message in str(excinfo.value)
+
+
+def test_reconcile_form_posts_long_decimal_threshold(client, app):
+    _seed(app)
+    candidate = _candidate(app, base_rows())
+    page = client.get(f"/months/2026-11/batches/{candidate['id']}")
+    assert 'step="any"' in page.get_data(as_text=True)
+    response = client.post(
+        f"/months/2026-11/batches/{candidate['id']}/reconcile",
+        data={
+            "max_key_missing_ratio": "0.3333333333333333",
+            "max_null_rate_diff": "0.1",
+            "max_bin_share_diff": "0.05",
+        },
+        follow_redirects=True,
+    )
+    assert response.status_code == 200
+    assert "核对通过" in response.get_data(as_text=True)
+
+
+def test_new_report_keeps_thresholds_and_counts(app):
+    """新报告保留所填上限与判定所用计数，页面标记与结论一致。"""
+    _seed_rows(app, [("A", f"2026-11-0{d}", d * 10, d) for d in (1, 2, 3)])
+    rows = [("A", "2026-11-01", 10, 1), ("A", "2026-11-02", 20, 2)]
+    candidate = _candidate(app, rows)
+    report = _reconcile(
+        app, candidate["id"], key="0.3333333333333333", null="0.10", share="0.5"
+    )
+    assert report["verdict"] == "rejected"
+    with app.app_context():
+        stored = service.get_report(report["report_no"])
+    # 所填上限按十进制文本原样留存
+    assert stored["thresholds"] == {
+        "max_key_missing_ratio": "0.3333333333333333",
+        "max_null_rate_diff": "0.10",
+        "max_bin_share_diff": "0.5",
+    }
+    channel = stored["details"]["channels"][0]
+    # 判定所用计数与超限标记随报告留存
+    assert channel["baseline_key_count"] == 3
+    assert channel["candidate_key_count"] == 2
+    assert channel["missing_key_count"] == 1
+    assert channel["missing_ratio_text"] == "1/3≈0.333333"
+    assert channel["missing_over"] is True
+    assert channel["amount"]["baseline_null_count"] == 0
+    assert channel["amount"]["candidate_null_count"] == 0
+    assert channel["amount"]["null_rate_over"] is False
+    assert channel["amount"]["share_overs"] is not None
+
+    # 回查页面：超限标记、退回原因与结论一致
+    page = app.test_client().get(f"/reports/{report['report_no']}")
+    text = page.get_data(as_text=True)
+    assert 'class="over"' in text
+    assert "1/3≈0.333333" in text
+    assert "超过上限 0.3333333333333333" in text
+    assert "核对未通过" in text
+
+
+def test_legacy_passed_report_cannot_be_confirmed(app):
+    """升级前通过但未确认的报告：不能确认，页面提示重新核对。"""
+    _seed(app)
+    candidate = _candidate(app, base_rows())
+    report = _reconcile(app, candidate["id"])
+    assert report["verdict"] == "passed"
+    _downgrade_report_to_legacy(app, report["report_no"])
+
+    with app.app_context():
+        with pytest.raises(service.ServiceError, match="重新核对"):
+            service.confirm_report(report["report_no"])
+        # 报告状态、候选批与现行批均保持不变
+        assert service.get_report(report["report_no"])["status"] == "passed"
+        assert service.get_active_batch("2026-11")["version"] == 1
+        assert get_db().execute(
+            "SELECT status FROM batches WHERE id = ?", (candidate["id"],)
+        ).fetchone()["status"] == "pending"
+
+    page = app.test_client().get(f"/reports/{report['report_no']}")
+    text = page.get_data(as_text=True)
+    assert "旧口径" in text
+    assert "重新核对" in text
+    assert "确认生效</button>" not in text
+
+    # 用已上传的候选批重新核对，取得新通过报告后可以确认
+    new_report = _reconcile(app, candidate["id"])
+    assert new_report["verdict"] == "passed"
+    with app.app_context():
+        outcome = service.confirm_report(new_report["report_no"])
+        assert outcome["ok"] is True
+        assert service.get_active_batch("2026-11")["version"] == 2
+
+
+def test_legacy_report_lookup_keeps_original_conclusion(app):
+    """旧报告仍可按号查原结论，页面按当时口径展示。"""
+    _seed(app)
+    rows = [
+        row
+        for row in base_rows()
+        if not (row[0] == "B" and row[1] == "2026-11-03")
+    ]
+    candidate = _candidate(app, rows)
+    rejected = _reconcile(app, candidate["id"], key=0.0)
+    assert rejected["verdict"] == "rejected"
+    _downgrade_report_to_legacy(app, rejected["report_no"])
+
+    client = app.test_client()
+    page = client.get(f"/reports/{rejected['report_no']}")
+    text = page.get_data(as_text=True)
+    assert page.status_code == 200
+    assert "核对未通过" in text
+    assert "键缺失比例" in text
+    assert 'class="over"' in text  # 旧口径页面标记保持原样
+
+    search = client.get(f"/reports?report_no={rejected['report_no']}")
+    search_text = search.get_data(as_text=True)
+    assert rejected["report_no"] in search_text
+    assert "退回" in search_text

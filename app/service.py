@@ -6,6 +6,8 @@ import json
 import sqlite3
 from collections import defaultdict
 from datetime import datetime, timezone
+from decimal import Decimal, InvalidOperation
+from fractions import Fraction
 from typing import Any
 
 from . import stats
@@ -21,7 +23,9 @@ REPORT_REJECTED = "rejected"
 REPORT_CONFIRMED = "confirmed"
 REPORT_STALE = "stale"
 
-EPSILON = 1e-12
+# 报告 details 的格式版本：2 起为精确计数口径（上限按十进制精确比较，
+# 判定所用计数与超限标记随报告留存）。缺失该标记的报告视为升级前旧口径。
+REPORT_FORMAT = 2
 
 
 class ServiceError(Exception):
@@ -31,6 +35,30 @@ class ServiceError(Exception):
         super().__init__(message)
         self.message = message
         self.status = status
+
+
+class ExactThresholdText(str):
+    """报告中留存的精确十进制上限文本。
+
+    本质是字符串（页面原样展示所填数字），同时与同值的 int/float/Decimal
+    宽松相等，方便回查时按数值或按文本核对。
+    """
+
+    def __eq__(self, other: object) -> bool:
+        if isinstance(other, str):
+            return str.__eq__(self, other)
+        if isinstance(other, bool):
+            return False
+        if isinstance(other, int):
+            return Decimal(self) == Decimal(other)
+        if isinstance(other, float):
+            return Decimal(self) == Decimal(str(other))
+        if isinstance(other, Decimal):
+            return Decimal(self) == other
+        return NotImplemented
+
+    def __hash__(self) -> int:
+        return str.__hash__(self)
 
 
 def now_iso() -> str:
@@ -47,8 +75,9 @@ def validate_month(month: str) -> str:
     return month
 
 
-def validate_thresholds(values: dict[str, Any]) -> dict[str, float]:
-    thresholds: dict[str, float] = {}
+def validate_thresholds(values: dict[str, Any]) -> dict[str, Decimal]:
+    """解析三项上限为精确十进制：只接受 0 到 1 之间的有限十进制数。"""
+    thresholds: dict[str, Decimal] = {}
     labels = {
         "max_key_missing_ratio": "键缺失比例上限",
         "max_null_rate_diff": "空值率差上限",
@@ -58,12 +87,13 @@ def validate_thresholds(values: dict[str, Any]) -> dict[str, float]:
         raw = values.get(key)
         if raw is None or str(raw).strip() == "":
             raise ServiceError(f"请填写{label}")
+        text = str(raw).strip()
         try:
-            number = float(str(raw).strip())
-        except ValueError:
-            raise ServiceError(f"{label}必须是数字")
-        if number != number or number in (float("inf"), float("-inf")):
-            raise ServiceError(f"{label}必须是有限数字")
+            number = Decimal(text)
+        except InvalidOperation:
+            raise ServiceError(f"{label}必须是有限十进制数")
+        if number.is_nan() or number.is_infinite():
+            raise ServiceError(f"{label}必须是有限十进制数")
         if number < 0 or number > 1:
             raise ServiceError(f"{label}应在 0 到 1 之间")
         thresholds[key] = number
@@ -344,8 +374,41 @@ def get_batch_rows(batch_id: int, limit: int = 200, offset: int = 0) -> dict:
 # ---------------------------------------------------------------------------
 
 
-def _exceeds(value: float | None, limit: float) -> bool:
-    return value is not None and abs(value) - limit > EPSILON
+def _finite_decimal_text(value: Fraction) -> str | None:
+    """若分数可写成有限十进制，返回其精确小数字符串，否则返回 None。"""
+    numerator, denominator = value.numerator, value.denominator
+    twos = fives = 0
+    while denominator % 2 == 0:
+        denominator //= 2
+        twos += 1
+    while denominator % 5 == 0:
+        denominator //= 5
+        fives += 1
+    if denominator != 1:
+        return None
+    places = max(twos, fives)
+    scaled = numerator * (2 ** (places - twos)) * (5 ** (places - fives))
+    sign = "-" if scaled < 0 else ""
+    digits = str(abs(scaled)).rjust(places + 1, "0")
+    if places:
+        digits = digits[:-places] + "." + digits[-places:]
+    return sign + digits
+
+
+def _ratio_text(value: Fraction) -> str:
+    """比例的精确文本：有限小数直接写出，否则给 分子/分母≈近似值。"""
+    text = _finite_decimal_text(value)
+    if text is not None:
+        return text
+    return f"{value.numerator}/{value.denominator}≈{float(value):.6f}"
+
+
+def _diff_text(value: Fraction) -> str:
+    """带符号的差值文本，用于报告原因与页面展示。"""
+    if value == 0:
+        return "0"
+    text = _ratio_text(abs(value))
+    return ("+" if value > 0 else "-") + text
 
 
 def _candidate_channel_data(candidate_id: int) -> dict[str, dict]:
@@ -392,8 +455,14 @@ def reconcile(candidate_id: int, raw_thresholds: dict[str, Any]) -> dict:
     """只读候选明细与基线预存键/统计，生成核对报告。
 
     读阶段使用独立的只读快照，不写库；报告写入阶段重新确认基线版本。
+    三类偏差都由计数算出精确分数，与所填十进制上限按绝对值精确比较，
+    等于上限也算达标。
     """
     thresholds = validate_thresholds(raw_thresholds)
+    limits = {key: Fraction(value) for key, value in thresholds.items()}
+    threshold_texts = {
+        key: format(value, "f") for key, value in thresholds.items()
+    }
     db = get_db()
 
     db.execute("BEGIN")
@@ -428,7 +497,8 @@ def reconcile(candidate_id: int, raw_thresholds: dict[str, Any]) -> dict:
         },
         snapshot,
         candidate_data,
-        thresholds,
+        limits,
+        threshold_texts,
     )
     verdict = REPORT_REJECTED if violations else REPORT_PASSED
 
@@ -438,7 +508,7 @@ def reconcile(candidate_id: int, raw_thresholds: dict[str, Any]) -> dict:
         candidate_version=int(candidate["version"]),
         baseline_id=baseline_id,
         baseline_version=baseline_version,
-        thresholds=thresholds,
+        thresholds=threshold_texts,
         details=details,
         verdict=verdict,
         violations=violations,
@@ -450,7 +520,8 @@ def _evaluate(
     baseline: dict,
     snapshot: dict,
     candidate_data: dict[str, dict],
-    thresholds: dict[str, float],
+    limits: dict[str, Fraction],
+    threshold_texts: dict[str, str],
 ) -> tuple[dict, list[str]]:
     violations: list[str] = []
     channels: list[dict] = []
@@ -470,16 +541,19 @@ def _evaluate(
         candidate_keys = candidate["keys"] if candidate else set()
         missing_keys = base_keys - candidate_keys
         missing_ratio = (
-            len(missing_keys) / base_key_count if base_key_count else 0.0
+            Fraction(len(missing_keys), base_key_count)
+            if base_key_count
+            else Fraction(0)
         )
         candidate_key_count = candidate["row_count"] if candidate else 0
+        missing_over = abs(missing_ratio) > limits["max_key_missing_ratio"]
 
         channel_violations: list[str] = []
-        if _exceeds(missing_ratio, thresholds["max_key_missing_ratio"]):
+        if missing_over:
             reason = (
-                f"渠道 {channel}：键缺失比例 {missing_ratio:.4f}"
+                f"渠道 {channel}：键缺失比例 {_ratio_text(missing_ratio)}"
                 f"（缺 {len(missing_keys)} / {base_key_count} 个键），"
-                f"超过上限 {thresholds['max_key_missing_ratio']:.4f}"
+                f"超过上限 {threshold_texts['max_key_missing_ratio']}"
             )
             channel_violations.append(reason)
 
@@ -490,7 +564,8 @@ def _evaluate(
             candidate["amount_values"] if candidate else [],
             candidate_key_count,
             candidate["amount_null"] if candidate else None,
-            float(stat["amount_null_rate"]),
+            base_key_count,
+            limits,
             present=candidate is not None,
         )
         conversion_candidate = _metric_comparison(
@@ -498,7 +573,8 @@ def _evaluate(
             candidate["conversion_values"] if candidate else [],
             candidate_key_count,
             candidate["conversions_null"] if candidate else None,
-            float(stat["conversions_null_rate"]),
+            base_key_count,
+            limits,
             present=candidate is not None,
         )
 
@@ -508,21 +584,33 @@ def _evaluate(
         ):
             if not comparison["present"]:
                 continue
-            diff = comparison["null_rate_diff"]
-            if _exceeds(diff, thresholds["max_null_rate_diff"]):
+            if comparison["null_rate_over"]:
                 reason = (
-                    f"渠道 {channel}：{metric_label}空值率差 {diff:+.4f}，"
-                    f"超过上限 {thresholds['max_null_rate_diff']:.4f}"
+                    f"渠道 {channel}：{metric_label}空值率差"
+                    f" {comparison['null_rate_diff_text']}"
+                    f"（候选空值 {comparison['candidate_null_count']}"
+                    f"/{candidate_key_count}，"
+                    f"基线空值 {comparison['baseline_null_count']}"
+                    f"/{base_key_count}），"
+                    f"超过上限 {threshold_texts['max_null_rate_diff']}"
                 )
                 channel_violations.append(reason)
-            for label, share_diff in zip(
-                comparison["labels"], comparison["share_diffs"]
+            for label, diff_text, over, candidate_count, baseline_count in zip(
+                comparison["labels"],
+                comparison["share_diff_texts"] or [],
+                comparison["share_overs"] or [],
+                comparison["candidate_counts"],
+                comparison["baseline_counts"],
             ):
-                if _exceeds(share_diff, thresholds["max_bin_share_diff"]):
+                if over:
                     reason = (
                         f"渠道 {channel}：{metric_label}分箱「{label}」"
-                        f"非空占比差 {share_diff:+.4f}，"
-                        f"超过上限 {thresholds['max_bin_share_diff']:.4f}"
+                        f"非空占比差 {diff_text}"
+                        f"（候选 {candidate_count}"
+                        f"/{comparison['candidate_nonempty']}，"
+                        f"基线 {baseline_count}"
+                        f"/{comparison['baseline_nonempty']}），"
+                        f"超过上限 {threshold_texts['max_bin_share_diff']}"
                     )
                     channel_violations.append(reason)
 
@@ -533,7 +621,9 @@ def _evaluate(
                 "baseline_key_count": base_key_count,
                 "candidate_key_count": candidate_key_count,
                 "missing_key_count": len(missing_keys),
-                "missing_ratio": missing_ratio,
+                "missing_ratio": float(missing_ratio),
+                "missing_ratio_text": _ratio_text(missing_ratio),
+                "missing_over": missing_over,
                 "amount": amount_candidate,
                 "conversions": conversion_candidate,
                 "violations": channel_violations,
@@ -541,8 +631,9 @@ def _evaluate(
         )
 
     details = {
+        "format": REPORT_FORMAT,
         "baseline": baseline,
-        "thresholds": thresholds,
+        "thresholds": threshold_texts,
         "channels": channels,
         "missing_channels": missing_channels,
         "extra_channels": extra_channels,
@@ -556,40 +647,86 @@ def _metric_comparison(
     candidate_values: list[float],
     candidate_key_count: int,
     candidate_null_count: int | None,
-    baseline_null_rate: float,
+    baseline_key_count: int,
+    limits: dict[str, Fraction],
     *,
     present: bool,
 ) -> dict:
+    """单项指标对比：空值率差与分箱占比差都由计数算出精确分数。
+
+    基线侧只使用预存的键数、非空数与各箱计数；候选侧由明细计数。
+    超限标记在此一次判定并随报告留存，回查页面直接读取。
+    """
     cuts = baseline_bins["cuts"]
     candidate_bins = stats.build_bins(candidate_values, cuts)
-    if not present or candidate_key_count == 0:
-        candidate_null_rate = None
-        null_rate_diff = None
-        share_diffs = None
-    else:
-        candidate_null_rate = candidate_null_count / candidate_key_count
-        null_rate_diff = candidate_null_rate - baseline_null_rate
-        share_diffs = [
-            candidate_share - baseline_share
-            for candidate_share, baseline_share in zip(
-                candidate_bins["shares"], baseline_bins["shares"]
-            )
-        ]
-    return {
+    baseline_nonempty = int(baseline_bins["nonempty"])
+    baseline_counts = [int(count) for count in baseline_bins["counts"]]
+    baseline_null_count = baseline_key_count - baseline_nonempty
+    baseline_null_rate = (
+        Fraction(baseline_null_count, baseline_key_count)
+        if baseline_key_count
+        else Fraction(0)
+    )
+    candidate_nonempty = int(candidate_bins["nonempty"])
+    candidate_counts = [int(count) for count in candidate_bins["counts"]]
+
+    comparison: dict[str, Any] = {
         "present": present,
         "labels": baseline_bins["labels"],
         "cuts": cuts,
-        "baseline_counts": baseline_bins["counts"],
-        "candidate_counts": candidate_bins["counts"],
-        "baseline_shares": baseline_bins["shares"],
+        "baseline_counts": baseline_counts,
+        "candidate_counts": candidate_counts,
+        "baseline_nonempty": baseline_nonempty,
+        "candidate_nonempty": candidate_nonempty,
+        "baseline_null_count": baseline_null_count,
+        "baseline_null_rate": float(baseline_null_rate),
+        "baseline_shares": [
+            float(Fraction(count, baseline_nonempty)) if baseline_nonempty else 0.0
+            for count in baseline_counts
+        ],
         "candidate_shares": candidate_bins["shares"],
-        "share_diffs": share_diffs,
-        "baseline_nonempty": baseline_bins["nonempty"],
-        "candidate_nonempty": candidate_bins["nonempty"],
-        "baseline_null_rate": baseline_null_rate,
-        "candidate_null_rate": candidate_null_rate,
-        "null_rate_diff": null_rate_diff,
+        "candidate_null_count": None,
+        "candidate_null_rate": None,
+        "null_rate_diff": None,
+        "null_rate_diff_text": None,
+        "null_rate_over": False,
+        "share_diffs": None,
+        "share_diff_texts": None,
+        "share_overs": None,
     }
+    if not present or candidate_key_count == 0:
+        return comparison
+
+    candidate_null_rate = Fraction(candidate_null_count, candidate_key_count)
+    null_rate_diff = candidate_null_rate - baseline_null_rate
+    share_diffs: list[Fraction] = []
+    for candidate_count, baseline_count in zip(candidate_counts, baseline_counts):
+        candidate_share = (
+            Fraction(candidate_count, candidate_nonempty)
+            if candidate_nonempty
+            else Fraction(0)
+        )
+        baseline_share = (
+            Fraction(baseline_count, baseline_nonempty)
+            if baseline_nonempty
+            else Fraction(0)
+        )
+        share_diffs.append(candidate_share - baseline_share)
+    comparison.update(
+        {
+            "candidate_null_count": candidate_null_count,
+            "candidate_null_rate": float(candidate_null_rate),
+            "null_rate_diff": float(null_rate_diff),
+            "null_rate_diff_text": _diff_text(null_rate_diff),
+            "null_rate_over": abs(null_rate_diff) > limits["max_null_rate_diff"],
+            "share_diffs": [float(diff) for diff in share_diffs],
+            "share_diff_texts": [_diff_text(diff) for diff in share_diffs],
+            "share_overs": [
+                abs(diff) > limits["max_bin_share_diff"] for diff in share_diffs
+            ],
+        }
+    )
+    return comparison
 
 
 def _next_report_no(db: sqlite3.Connection) -> str:
@@ -672,7 +809,62 @@ def get_report(report_no: str) -> dict | None:
     report["thresholds"] = json.loads(report["thresholds"])
     report["details"] = json.loads(report["details"])
     report["reasons"] = json.loads(report["reasons"])
+    if report["details"].get("format") != REPORT_FORMAT:
+        _backfill_legacy_flags(report)
+    else:
+        report["thresholds"] = {
+            key: ExactThresholdText(value) if isinstance(value, str) else value
+            for key, value in report["thresholds"].items()
+        }
+        details_thresholds = report["details"].get("thresholds")
+        if isinstance(details_thresholds, dict):
+            report["details"]["thresholds"] = {
+                key: ExactThresholdText(value) if isinstance(value, str) else value
+                for key, value in details_thresholds.items()
+            }
     return report
+
+
+def _backfill_legacy_flags(report: dict) -> None:
+    """为升级前的旧报告补算页面超限标记。
+
+    旧报告没有随存的判定标记，这里按当时的浮点 > 口径补算，
+    保证按号回查时页面展示与原始结论一致。
+    """
+    thresholds = report["thresholds"]
+
+    def _number(value: Any) -> bool:
+        return isinstance(value, (int, float)) and not isinstance(value, bool)
+
+    for channel in report["details"].get("channels", []):
+        missing_ratio = channel.get("missing_ratio")
+        key_limit = thresholds.get("max_key_missing_ratio")
+        channel["missing_over"] = (
+            _number(missing_ratio)
+            and _number(key_limit)
+            and missing_ratio > key_limit
+        )
+        for metric_key in ("amount", "conversions"):
+            metric = channel.get(metric_key)
+            if not metric:
+                continue
+            diff = metric.get("null_rate_diff")
+            null_limit = thresholds.get("max_null_rate_diff")
+            metric["null_rate_over"] = (
+                _number(diff) and _number(null_limit) and abs(diff) > null_limit
+            )
+            share_diffs = metric.get("share_diffs")
+            share_limit = thresholds.get("max_bin_share_diff")
+            metric["share_overs"] = (
+                [
+                    _number(diff)
+                    and _number(share_limit)
+                    and abs(diff) > share_limit
+                    for diff in share_diffs
+                ]
+                if share_diffs
+                else None
+            )
 
 
 def list_reports_for_month(month: str, limit: int = 100) -> list[dict]:
@@ -702,6 +894,14 @@ def confirm_report(report_no: str) -> dict:
             raise ServiceError("基线已换版，该报告已失效，请重新核对", 409)
         if report["status"] != REPORT_PASSED:
             raise ServiceError("核对未通过，不能确认", 409)
+
+        details = json.loads(report["details"])
+        if details.get("format") != REPORT_FORMAT:
+            raise ServiceError(
+                "该报告是升级前的旧口径结论，不能确认；"
+                "请用已上传的候选批重新核对，取得新通过报告后再确认。",
+                409,
+            )
 
         month = report["month"]
         active = db.execute(
